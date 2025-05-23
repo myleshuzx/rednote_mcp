@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import pytesseract
+from PIL import Image
+import requests
 # import time # Replaced with asyncio
 
 from playwright.async_api import async_playwright, BrowserContext, Page, Playwright # Changed to async_api
@@ -252,7 +255,7 @@ class BrowserHandler:
         print("页面/会话无效或未初始化，或登录状态失效。调用 initialize_and_get_page() 进行刷新。")
         return await self.initialize_and_get_page(headless=headless) # Added await, pass headless
 
-    async def search_notes(self, keywords: str, limit: int = 10, headless: bool = False) -> List[Dict[str, Any]]: # Added async, headless param
+    async def search_notes(self, keywords: str, limit: int = 10, headless: bool = False, image_ocr: bool = False) -> List[Dict[str, Any]]: # Added async, headless param
         # page = await self._ensure_logged_in_page(headless=headless) # Added await, pass headless
         self.context = await self._get_or_create_persistent_context(headless=headless)
         page = self.context.pages[0]
@@ -260,7 +263,7 @@ class BrowserHandler:
         
 
         await page.goto("https://www.xiaohongshu.com") # Added await
-        await asyncio.sleep(1) # Wait for page to settle
+        await asyncio.sleep(0.5) # Wait for page to settle
 
         # # Wait up to 3 seconds for the login element
         # print("检查登录状态 (最多等待3秒)...")
@@ -285,18 +288,6 @@ class BrowserHandler:
         await page.wait_for_selector("div.search-icon", timeout=60000) # Added await for possibly login.
         await page.click("div.search-icon", timeout=30000) # Added await
         
-        # my_profile_element = await self.page.query_selector("span.channel:has-text('我')")
-        # if not my_profile_element:
-        #     print("未成功登录，无法执行搜索。")
-        #     # 返回空列表，因为需要返回 List[Dict[str, Any]] 类型
-        #     return []
-        # try:
-        #     # Primary check: Look for the "我" profile element indicating successful login
-        #     my_profile_element = await self.page.query_selector("span.channel:has-text('我')")
-        # except Exception as e_filter_click:
-        #     print(f"用户未登录！: {e_filter_click}")
-
-        # click "image"
         try:
             await page.click("div#image.channel", timeout=10000) #图文filter, Added await
         except Exception as e_filter_click:
@@ -305,6 +296,9 @@ class BrowserHandler:
                 self.log_file_handler.write(f"[{datetime.now()}] Warning: Could not click '图文' filter: {e_filter_click}\n")
 
         await page.wait_for_selector("section.note-item", timeout=30000) # Added await
+
+        # 如果成功点击“图文”，则登录成功。
+        self.logged_in_successfully = True 
 
         # Fetch note URLs
         note_elements = await page.query_selector_all("section.note-item") # Added await
@@ -354,13 +348,42 @@ class BrowserHandler:
                     print(f"提取内容时出错 {note_url}: {e_content}")
 
                 # get images.
+                
+                if image_ocr:
+                    # delete all images in the folder
+                    image_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../image'))
+                    for f in os.listdir(image_folder):
+                        file_path = os.path.join(image_folder, f)
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+
                 images = []
+
                 img_elements = await page.query_selector_all("div.slide-container img.poster-image, div.swiper-slide img") # Added await
                 for img_el in img_elements:
                     src = await img_el.get_attribute("src") # Added await
                     if src and src.startswith("http"):
-                        images.append(src)
-
+                        # images.append(src)
+                        if image_ocr:
+                            image_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../image'))
+                            if not os.path.exists(image_folder):
+                                os.makedirs(image_folder)
+                            try:
+                                img_name = os.path.basename(src) + '.jpg'
+                                img_path = os.path.join(image_folder, img_name)
+                                response = requests.get(src, timeout=10)
+                                if response.status_code == 200:
+                                    with open(img_path, 'wb') as f:
+                                        f.write(response.content)
+                            except Exception as e:
+                                print(f"下载图片失败: {src}, 错误: {e}")
+                            text = pytesseract.image_to_string(Image.open('image//'+img_name), lang='chi_sim+eng')
+                            print(text)
+                            images.append(text)
+                        else:
+                            images.append(src)
+ 
+                
                 # get comments.
                 comments = []
                 try:
@@ -432,10 +455,12 @@ async def main_test(): # Added async
     print(f"Storage State File: {Path(STORAGE_STATE_FILE).resolve()}")
 
     handler = BrowserHandler(user_data_dir=USER_DATA_DIR, enable_logging=True)
+
     results = await handler.search_notes(
             keywords='notion',
-            limit=2,
-            headless=False
+            limit=1,
+            headless=False,
+            image_ocr = True
         )
     # try:
     #     # Example: run login headful for easier debugging if needed, or keep headless=True

@@ -35,13 +35,17 @@ browser_handler = BrowserHandler(user_data_dir=user_data_dir_to_use)
     name="search_note",
     description="Search for notes on Xiaohongshu based on keywords."
 )
-async def search_note_tool(keywords: str = Field(description="keywords"), limit: int = Field(default=10, description="number of results in return"), headless: bool = Field(default=False, description="whether to run browser in headless mode, False: use GUI browser, True: not use GUI browser"))-> Dict[str, Any]:
+async def search_note_tool(keywords: str = Field(description="keywords"), 
+                           limit: int = Field(default=10, description="number of results in return"), 
+                           headless: bool = Field(default=False, description="whether to run browser in headless mode, False: use GUI browser, True: not use GUI browser"), 
+                           image_ocr: bool = Field(default=False, description="read image by ocr"))-> Dict[str, Any]:
     """Searches for notes based on keywords."""
     try:
         results = await browser_handler.search_notes(
             keywords=keywords,
             limit=limit,
-            headless=headless
+            headless=headless,
+            image_ocr=image_ocr
         )
         return {"results": results}
     finally:
