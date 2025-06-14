@@ -7,9 +7,12 @@ from datetime import datetime
 import pytesseract
 from PIL import Image
 import requests
-# import time # Replaced with asyncio
+import time
+
 
 from playwright.async_api import async_playwright, BrowserContext, Page, Playwright # Changed to async_api
+
+import whisper
 
 # Global definitions for persistent context
 STORAGE_STATE_FILE = "playwright_state.json"
@@ -117,10 +120,10 @@ class BrowserHandler:
                 self.user_data_dir,
                 headless=headless, # Use passed headless argument
                 # headless=False,
-                channel="chrome",
-                slow_mo=500,
-                accept_downloads=True,
-                args=["--disable-blink-features=AutomationControlled"]
+                channel="chrome"
+                # slow_mo=500,
+                # accept_downloads=True,
+                # args=["--disable-blink-features=AutomationControlled"]
             )
             print("持久化浏览器上下文启动成功。")
             self.logged_in_successfully = False # Reset, will be verified
@@ -255,45 +258,252 @@ class BrowserHandler:
         print("页面/会话无效或未初始化，或登录状态失效。调用 initialize_and_get_page() 进行刷新。")
         return await self.initialize_and_get_page(headless=headless) # Added await, pass headless
 
-    async def search_notes(self, keywords: str, limit: int = 10, headless: bool = False, image_ocr: bool = False) -> List[Dict[str, Any]]: # Added async, headless param
+    async def search_notes(self, keywords: str, limit: int = 10, headless: bool = False, image_ocr: bool = False, video_asr: bool = False) -> List[Dict[str, Any]]: # Added async, headless param
+        # 方法一：使用 time.time()
+        start_time_tt = time.time()
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                                self.user_data_dir,
+                                headless=headless,
+                                channel="chrome"
+                            )
+
+            # page = await context.new_page()
+            # page = await context.new_page()
+            page = context.pages[0]
+
+            await page.goto("https://www.xiaohongshu.com") # Added await
+            await asyncio.sleep(0.5) # Wait for page to settle
+
+             # input and search.
+            await page.wait_for_selector("input#search-input", timeout=30000) # Added await
+            await page.fill("input#search-input", keywords) # Added await
+            await page.wait_for_selector("div.search-icon", timeout=60000) # Added await for possibly login.
+            await page.click("div.search-icon", timeout=30000) # Added await
+            await asyncio.sleep(0.5) # Wait for page to settle
+            
+            if video_asr == False: # if disable video asr, only image + text selected.
+                try:
+                    await page.click("div#image.channel", timeout=10000) #图文filter, Added await
+                    print(f"本次搜索仅图文")
+                except Exception as e_filter_click:
+                    print(f"无法点击 '图文' 筛选器 (可能不存在或页面结构已更改): {e_filter_click}")
+                    if self.logging_enabled and self.log_file_handler:
+                        self.log_file_handler.write(f"[{datetime.now()}] Warning: Could not click '图文' filter: {e_filter_click}\n")
+            else:
+                # await page.click("div#video.channel", timeout=10000) #图文filter, Added await
+                print(f"本次搜索视频+图文")
+
+            await page.wait_for_selector("section.note-item", timeout=30000) # Added await
+
+            # 如果成功点击“图文”，则登录成功。
+            self.logged_in_successfully = True 
+
+            # Fetch note URLs
+            note_elements = await page.query_selector_all("section.note-item") # Added await
+            note_urls_to_visit = []
+            for i, note_element in enumerate(note_elements):
+                if i >= limit: # Fetch more initial URLs in case some fail
+                    break
+                url = None
+                try:
+                    link_element = await note_element.query_selector("a[href^='/search_result/']") # Added await
+                    if not link_element:
+                        link_element = await note_element.query_selector("a.cover.mask.ld") # Fallback, Added await
+                    if link_element:
+                        href = await link_element.get_attribute("href") # Added await
+                        if href and not href.startswith("http"):
+                            url = f"https://www.xiaohongshu.com{href}"
+                        elif href:
+                            url = href
+                    if url:
+                        note_urls_to_visit.append(url)
+                except Exception as e_url_extract:
+                    print(f"提取笔记URL时出错: {e_url_extract}")
+
+                    # Fetch note details
+            # visit URLs.
+            results_data = []
+            # page_note = self.context.pages[1]
+            for i, note_url in enumerate(note_urls_to_visit):
+                if len(results_data) >= limit:
+                    break
+                try:
+                    print(f"正在访问笔记 {i+1}/{len(note_urls_to_visit)}: {note_url}")
+                    await page.goto(note_url, wait_until="domcontentloaded", timeout=60000) # Added await
+                    await page.wait_for_selector("div.note-content", timeout=15000) # Added await
+
+                    # get title.
+                    title_element = await page.query_selector("div#detail-title.title") # Added await
+                    title = (await title_element.inner_text()).strip() if title_element else (await page.title()).replace(" - 小红书", "").strip() # Added await
+                    title_element = await page.query_selector("div#detail-title.title") # Added await
+                    title = (await title_element.inner_text()).strip() if title_element else (await page.title()).replace(" - 小红书", "").strip() # Added await
+                    
+                    # get content.
+                    content = "N/A"
+                    try:
+                        desc_element = await page.query_selector("div#detail-desc span") # Added await
+                        if desc_element:
+                            content = (await desc_element.inner_text()).strip() # Added await
+                    except Exception as e_content:
+                        print(f"提取内容时出错 {note_url}: {e_content}")
+
+                    # get images and video.
+                    # if image_ocr:
+                    #     # delete all images in the folder
+                    #     image_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../image'))
+                    #     for f in os.listdir(image_folder):
+                    #         file_path = os.path.join(image_folder, f)
+                    #         if os.path.isfile(file_path):
+                    #             os.remove(file_path)
+
+
+                    images = []
+
+                    selector = "div.media-container.video-player-media" # Using the div and both classes
+                    element_count = await page.locator(selector).count()
+
+                    if element_count == 0: # image only
+                        print(f"该笔记：image + text only.")
+                        img_elements = await page.query_selector_all("div.slide-container img.poster-image, div.swiper-slide img") # Added await
+                        for img_el in img_elements:
+                            src = await img_el.get_attribute("src") # Added await
+                            if src and src.startswith("http"):
+                                # images.append(src)
+                                if image_ocr: # ocr
+                                    image_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../image'))
+                                    if not os.path.exists(image_folder):
+                                        os.makedirs(image_folder)
+                                    try:
+                                        # img_name = os.path.basename(src) + '.jpg'
+                                        img_name = 'download_image.jpg'
+                                        img_path = os.path.join(image_folder, img_name)
+                                        response = requests.get(src, timeout=10)
+                                        if response.status_code == 200:
+                                            with open(img_path, 'wb') as f:
+                                                f.write(response.content)
+                                    except Exception as e:
+                                        print(f"下载图片失败: {src}, 错误: {e}")
+                                    text = pytesseract.image_to_string(Image.open(image_folder+'\\'+img_name), lang='chi_sim+eng')
+                                    # print(f'ocr结果：{text}')
+                                    images.append(text)
+                                else:
+                                    images.append(src)
+                    else: # video only
+                        print(f"该笔记：video + text only.")
+                        # click start button.
+                        await page.locator('xg-start.xgplayer-start div.xgplayer-icon-play').click(timeout=5000)
+
+                        # get video link.
+                        # 尝试定位 <meta name="og:video" content="...">
+                        meta_tag_selector_name = 'meta[name="og:video"]'
+                        meta_element_name = await page.query_selector(meta_tag_selector_name)
+
+                        if meta_element_name:
+                            video_link = await meta_element_name.get_attribute('content')
+                        else:
+                            # 如果上面没找到，尝试 <meta property="og:video" content="..."> (更标准的 OG 标签)
+                            meta_tag_selector_property = 'meta[property="og:video"]'
+                            meta_element_property = await page.query_selector(meta_tag_selector_property)
+                            if meta_element_property:
+                                video_link = await meta_element_property.get_attribute('content')
+
+                        # download video.
+                        if video_link:
+                            # HTML中 &amp; 需要替换回 &
+                            video_link_out = video_link.replace('&amp;', '&')
+                            print(f"link:{video_link_out}")      
+                            if video_asr: # asr enable.
+                                # 下载视频
+                                response = requests.get(video_link_out, stream=True)
+                                with open("video//downloaded_video.mp4", "wb") as f:
+                                    for chunk in response.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            f.write(chunk)
+                                print("视频已下载到 downloaded_video.mp4")
+
+                                # video_2_text.
+                                # 加载模型 (例如 "tiny", "base", "small", "medium", "large")
+                                model = whisper.load_model("tiny")
+                                video_path = "video//downloaded_video.mp4"
+                                result = model.transcribe(video_path, language="zh")
+                                print(result["text"])
+
+                                images.append(result["text"])
+                            else:
+                                images.append(video_link_out)              
+                        else:
+                            print("未能通过 meta 标签找到视频链接。")
+
+                    # get comments.
+                    comments = []
+                    try:
+                        comments_el = await page.query_selector("div.comments-el")
+                        if comments_el:
+                            comment_text_elements = await comments_el.query_selector_all("span.note-text span") # Select the inner span for text
+                            for comment_el in comment_text_elements:
+                                comment_text = await comment_el.inner_text()
+                                if comment_text:
+                                    comments.append(comment_text.strip())
+                    except Exception as e_comment:
+                        print(f"提取评论时出错 {note_url}: {e_comment}")
+                    
+                    # results_data.append({"url": note_url, "title": title, "content": content, "images": images})
+                    # note_url =[]
+                    # title=[]
+                    # content=[]
+                    # images=[]
+                    # comments=[]
+                    results_data.append({"url": note_url, "title": title, "content": content, "images": images, "comments": comments})
+                
+
+                except Exception as e_detail:
+                    print(f"处理笔记详情页 {note_url} 时出错: {e_detail}")
+                    # if self.logging_enabled and self.log_file_handler:
+                    #     self.log_file_handler.write(f"[{datetime.now()}] Error processing note detail {note_url}: {e_detail}\n")
+        
+        # await self._save_session_state() # Added await, Save session after successful search operation
+        # await self.close()
+        # results_data = []
+        # print(results_data)
+        
+        end_time_tt = time.time()
+        elapsed_time_tt = end_time_tt - start_time_tt
+        print(f"使用 time.time() 計時: {elapsed_time_tt:.6f} 秒")
+
+        await page.close() # 修改
+        # await context.close()
+
+        return results_data
+
+    async def search_notes_bak(self, keywords: str, limit: int = 10, headless: bool = False, image_ocr: bool = False, video_asr: bool = False) -> List[Dict[str, Any]]: # Added async, headless param
         # page = await self._ensure_logged_in_page(headless=headless) # Added await, pass headless
         self.context = await self._get_or_create_persistent_context(headless=headless)
         page = self.context.pages[0]
+        # page = self.context.new_page()
 
         
 
         await page.goto("https://www.xiaohongshu.com") # Added await
         await asyncio.sleep(0.5) # Wait for page to settle
 
-        # # Wait up to 3 seconds for the login element
-        # print("检查登录状态 (最多等待3秒)...")
-        # login_verified = False
-        # for i in range(3):
-        #     my_profile_element = await page.query_selector("span.channel:has-text('我')")
-        #     if my_profile_element:
-        #         print("检测到 '我' 元素，用户已登录。")
-        #         login_verified = True
-        #         break
-        #     print(f"等待登录状态... ({i+1}/3 秒)")
-        #     await asyncio.sleep(1)
-
-        # if not login_verified and headless:
-        #     # print("3秒内未检测到 '我' 元素，假定未登录或页面加载问题。无法执行搜索。")
-        #     # return []
-        #     raise Exception("用户未登录，无法执行搜索。")
-    
         # input and search.
         await page.wait_for_selector("input#search-input", timeout=30000) # Added await
         await page.fill("input#search-input", keywords) # Added await
         await page.wait_for_selector("div.search-icon", timeout=60000) # Added await for possibly login.
         await page.click("div.search-icon", timeout=30000) # Added await
         
-        try:
-            await page.click("div#image.channel", timeout=10000) #图文filter, Added await
-        except Exception as e_filter_click:
-            print(f"无法点击 '图文' 筛选器 (可能不存在或页面结构已更改): {e_filter_click}")
-            if self.logging_enabled and self.log_file_handler:
-                self.log_file_handler.write(f"[{datetime.now()}] Warning: Could not click '图文' filter: {e_filter_click}\n")
+        if video_asr == False: # if disable video asr, only image + text selected.
+            try:
+                await page.click("div#image.channel", timeout=10000) #图文filter, Added await
+                print(f"本次搜索仅图文")
+            except Exception as e_filter_click:
+                print(f"无法点击 '图文' 筛选器 (可能不存在或页面结构已更改): {e_filter_click}")
+                if self.logging_enabled and self.log_file_handler:
+                    self.log_file_handler.write(f"[{datetime.now()}] Warning: Could not click '图文' filter: {e_filter_click}\n")
+        else:
+            await page.click("div#video.channel", timeout=10000) #图文filter, Added await
+            print(f"本次搜索视频+图文")
 
         await page.wait_for_selector("section.note-item", timeout=30000) # Added await
 
@@ -324,6 +534,7 @@ class BrowserHandler:
         
         # visit URLs.
         results_data = []
+        # page_note = self.context.pages[1]
         for i, note_url in enumerate(note_urls_to_visit):
             if len(results_data) >= limit:
                 break
@@ -335,8 +546,8 @@ class BrowserHandler:
                 # get title.
                 title_element = await page.query_selector("div#detail-title.title") # Added await
                 title = (await title_element.inner_text()).strip() if title_element else (await page.title()).replace(" - 小红书", "").strip() # Added await
-                title_element = await page.query_selector("div#detail-title.title") # Added await
-                title = (await title_element.inner_text()).strip() if title_element else (await page.title()).replace(" - 小红书", "").strip() # Added await
+                # title_element = await page.query_selector("div#detail-title.title") # Added await
+                # title = (await title_element.inner_text()).strip() if title_element else (await page.title()).replace(" - 小红书", "").strip() # Added await
                 
                 # get content.
                 content = "N/A"
@@ -357,33 +568,39 @@ class BrowserHandler:
                         if os.path.isfile(file_path):
                             os.remove(file_path)
 
+
                 images = []
 
-                img_elements = await page.query_selector_all("div.slide-container img.poster-image, div.swiper-slide img") # Added await
-                for img_el in img_elements:
-                    src = await img_el.get_attribute("src") # Added await
-                    if src and src.startswith("http"):
-                        # images.append(src)
-                        if image_ocr:
-                            image_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../image'))
-                            if not os.path.exists(image_folder):
-                                os.makedirs(image_folder)
-                            try:
-                                img_name = os.path.basename(src) + '.jpg'
-                                img_path = os.path.join(image_folder, img_name)
-                                response = requests.get(src, timeout=10)
-                                if response.status_code == 200:
-                                    with open(img_path, 'wb') as f:
-                                        f.write(response.content)
-                            except Exception as e:
-                                print(f"下载图片失败: {src}, 错误: {e}")
-                            text = pytesseract.image_to_string(Image.open('image//'+img_name), lang='chi_sim+eng')
-                            print(text)
-                            images.append(text)
-                        else:
-                            images.append(src)
- 
-                
+                selector = "div.media-container.video-player-media" # Using the div and both classes
+                element_count = await page.locator(selector).count()
+
+                if element_count == 0: # image only
+                    print(f"该笔记：image + text only.")
+                    img_elements = await page.query_selector_all("div.slide-container img.poster-image, div.swiper-slide img") # Added await
+                    for img_el in img_elements:
+                        src = await img_el.get_attribute("src") # Added await
+                        if src and src.startswith("http"):
+                            # images.append(src)
+                            if image_ocr: # ocr
+                                image_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../image'))
+                                if not os.path.exists(image_folder):
+                                    os.makedirs(image_folder)
+                                try:
+                                    img_name = os.path.basename(src) + '.jpg'
+                                    img_path = os.path.join(image_folder, img_name)
+                                    response = requests.get(src, timeout=10)
+                                    if response.status_code == 200:
+                                        with open(img_path, 'wb') as f:
+                                            f.write(response.content)
+                                except Exception as e:
+                                    print(f"下载图片失败: {src}, 错误: {e}")
+                                text = pytesseract.image_to_string(Image.open('image//'+img_name), lang='chi_sim+eng')
+                                print(f'ocr结果：{text}')
+                                images.append(text)
+                            else:
+                                images.append(src)
+            
+
                 # get comments.
                 comments = []
                 try:
@@ -406,8 +623,10 @@ class BrowserHandler:
 
         await self._save_session_state() # Added await, Save session after successful search operation
         await self.close()
-        # print(results_data)
+        print(results_data)
+        
         return results_data
+        
 
     async def close(self) -> None: # Added async
         print("正在准备关闭 BrowserHandler...")
@@ -457,11 +676,20 @@ async def main_test(): # Added async
     handler = BrowserHandler(user_data_dir=USER_DATA_DIR, enable_logging=True)
 
     results = await handler.search_notes(
-            keywords='notion',
+            keywords='广州植物园',
             limit=1,
             headless=False,
-            image_ocr = True
+            image_ocr = True,
+            video_asr = True,
         )
+
+    # results = await handler.search_notes_bak(
+    #         keywords='广州植物园',
+    #         limit=1,
+    #         headless=False,
+    #         image_ocr = False,
+    #         video_asr = False,
+    #     )
     # try:
     #     # Example: run login headful for easier debugging if needed, or keep headless=True
     #     await handler.login(headless=False) # Added await, pass headless
